@@ -10,7 +10,6 @@ mcp[cli]
 gradio
 
 # --- Optional / Model Specific ---
-# Add libraries for your actual model here if needed, e.g.:
-# tensorflow
-# torch
-# scikit-learn
+openai
+anthropic
+google.generativeai

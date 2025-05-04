@@ -5,25 +5,11 @@ import json
 from abc import ABC, abstractmethod
 import asyncio
 
-# 导入 OpenAI SDK
-try:
-    from openai import OpenAI, AsyncOpenAI, APIError, RateLimitError, APIConnectionError
-except ImportError:
-    OpenAI = None
-    AsyncOpenAI = None
-    APIError = RateLimitError = APIConnectionError = Exception
-
-# 导入其他 SDK
-try:
-    from anthropic import Anthropic, AsyncAnthropic
-except ImportError:
-    Anthropic = None
-    AsyncAnthropic = None
-
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
+# 导入各提供商的 SDK
+from openai import OpenAI, AsyncOpenAI, APIError, RateLimitError, APIConnectionError
+from anthropic import Anthropic, AsyncAnthropic
+import google.generativeai as genai
+import config # 导入配置
 
 import config
 
