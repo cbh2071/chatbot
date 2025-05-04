@@ -1,0 +1,16 @@
+# requirements.txt
+
+# For making HTTP requests (UniProt API)
+httpx
+
+# For the MCP server and client functionality (includes CLI tools)
+mcp[cli]
+
+# For the web user interface
+gradio
+
+# --- Optional / Model Specific ---
+# Add libraries for your actual model here if needed, e.g.:
+# tensorflow
+# torch
+# scikit-learn
