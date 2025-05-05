@@ -41,38 +41,32 @@ class AgentCore:
         """启动 Agent Core，包括启动和连接 MCP 客户端。"""
         if self.mcp_session and not self.mcp_session.is_closing:
             logger.info("MCP 客户端已在运行。")
+            if not self._mcp_ready.is_set():
+                 self._mcp_ready.set()
             return True
 
         logger.info("正在启动 MCP 客户端...")
         try:
             server_params = StdioServerParameters(
-                command=sys.executable, # 使用当前 python 解释器
-                args=[self.mcp_server_script], # 要运行的服务器脚本
-                cwd=os.path.dirname(os.path.abspath(__file__)), # 在当前目录运行
+                command=sys.executable,
+                args=[self.mcp_server_script],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
             )
-
-            # 使用 AsyncExitStack 管理 stdio_client 的上下文
             streams = await self.mcp_exit_stack.enter_async_context(stdio_client(server_params))
-
-            # 使用获取到的流创建 ClientSession
             self.mcp_session = await self.mcp_exit_stack.enter_async_context(
-                ClientSession(streams[0], streams[1]) # streams[0] is read, streams[1] is write
+                ClientSession(streams[0], streams[1])
             )
-
-            # 初始化 MCP 连接 (握手)，并捕获返回结果
             init_result = await self.mcp_session.initialize()
-
-            # 从返回结果中获取服务器能力和信息
             server_caps = init_result.capabilities
-            server_info = init_result.serverInfo # 也可以获取服务器信息
-
+            server_info = init_result.serverInfo
             logger.info(f"MCP 连接成功。服务器: {server_info.name} v{server_info.version}, 能力: {server_caps}")
-            self._mcp_ready.set() # 标记 MCP 已就绪
+            self._mcp_ready.set()
+            # 添加小的延迟，确保服务器完全初始化
+            await asyncio.sleep(0.1)
             return True
-
         except Exception as e:
             logger.exception("启动 MCP 客户端失败!")
-            await self.stop() # 尝试清理
+            await self.stop()
             self._mcp_ready.clear()
             return False
 
@@ -128,6 +122,8 @@ class AgentCore:
         1.  **直接回复:** 如果请求是闲聊、问候、简单问题，或者你认为不需要工具就能回答。
         2.  **调用工具:** 如果用户的请求需要通过调用上述某个工具来完成。
 
+        **重要提示:** 对于 `search_proteins` 工具，如果用户的查询涉及到生物学功能、蛋白质类别或酶名称等描述性词语（例如"激酶"、"转运蛋白"、"免疫球蛋白"），请**务必将这些词语转换为对应的标准英文术语或常用英文表达**（例如，"激酶"应转换为 "kinase"，"酪氨酸激酶"应转换为 "tyrosine kinase"）再填入 `query` 参数。UniProt 主要使用英文进行索引。物种名称也直接使用英文（如 "Homo sapiens"）。
+
         **你的输出必须是严格的 JSON 格式，包含以下字段:**
         - `action`: 字符串，值为 "direct_response" 或 "call_tool"。
         - `tool_name`: 字符串，如果 action 是 "call_tool"，则为要调用的工具名称；否则为 null。
@@ -160,10 +156,7 @@ class AgentCore:
 
     async def _execute_tool(self, tool_name: str, arguments: dict) -> dict:
         """
-        通过官方 MCP ClientSession 调用指定的工具。
-        :param tool_name: 要调用的工具名称。
-        :param arguments: 传递给工具的参数。
-        :return: 工具返回的结果字典，或包含 'error' 的字典。
+        通过官方 MCP ClientSession 调用指定的工具，并使用 asyncio.wait_for 控制超时。
         """
         if not await self._ensure_mcp_ready():
              return {"error": "MCP 客户端不可用，无法执行工具。"}
@@ -174,12 +167,13 @@ class AgentCore:
 
         logger.info(f"Agent Core: 开始执行工具 '{tool_name}'，参数: {arguments}")
 
-        # 设置工具特定的超时时间
         tool_timeout = 90.0 if tool_name == "search_proteins" else 30.0
-        logger.info(f"为工具 '{tool_name}' 设置超时: {tool_timeout} 秒")
+        logger.info(f"为工具 '{tool_name}' 设置超时: {tool_timeout} 秒 (使用 asyncio.wait_for)")
 
+        # 添加日志：准备调用
+        logger.info(f"准备通过 asyncio.wait_for 调用 mcp_session.call_tool for '{tool_name}'...")
         try:
-            # 使用 asyncio.wait_for 包装 call_tool 调用
+            # 使用 asyncio.wait_for 包装 await 调用
             result: mcp_types.CallToolResult = await asyncio.wait_for(
                 self.mcp_session.call_tool(
                     name=tool_name,
@@ -187,7 +181,8 @@ class AgentCore:
                 ),
                 timeout=tool_timeout
             )
-            logger.info(f"Agent Core: 工具 '{tool_name}' 执行完成。")
+            # 添加日志：调用返回
+            logger.info(f"asyncio.wait_for mcp_session.call_tool for '{tool_name}' 调用返回（可能成功或工具内部错误）。")
 
             if result.isError:
                 error_content = result.content[0].text if result.content and isinstance(result.content[0], mcp_types.TextContent) else "未知工具错误"
@@ -200,10 +195,14 @@ class AgentCore:
                         try:
                             parsed_result = json.loads(content_item.text)
                             logger.debug(f"工具 '{tool_name}' 返回结果 (解析后): {parsed_result}")
-                            # 确保返回的是 List[Dict] 或 Dict[str, Any]
+                            # 对 search_proteins 做检查
                             if tool_name == "search_proteins" and not isinstance(parsed_result, list):
                                 logger.warning(f"Search tool did not return a list: {type(parsed_result)}")
                                 return {"error": "Search tool returned unexpected format."}
+                            # 对 get_protein_data 确保返回字典
+                            if tool_name == "get_protein_data" and not isinstance(parsed_result, dict):
+                                logger.warning(f"Get Protein Data tool did not return a dict: {type(parsed_result)}")
+                                return {"error": "Get Protein Data tool returned unexpected format."}
                             return parsed_result
                         except json.JSONDecodeError:
                             logger.warning(f"工具 '{tool_name}' 返回了非 JSON 文本，直接使用。")
@@ -214,6 +213,9 @@ class AgentCore:
                          if tool_name == "search_proteins" and not isinstance(parsed_result, list):
                               logger.warning(f"Search tool did not return a list: {type(parsed_result)}")
                               return {"error": "Search tool returned unexpected format."}
+                         if tool_name == "get_protein_data" and not isinstance(parsed_result, dict):
+                              logger.warning(f"Get Protein Data tool did not return a dict: {type(parsed_result)}")
+                              return {"error": "Get Protein Data tool returned unexpected format."}
                          return parsed_result
                     else:
                          logger.warning(f"工具 '{tool_name}' 返回了未预期的内容类型或空内容。")
@@ -226,10 +228,12 @@ class AgentCore:
                     return {"success": True, "raw_content": "Complex or empty content"}
 
         except asyncio.TimeoutError:
-             logger.error(f"调用 MCP 工具 '{tool_name}' 超时（超过 {tool_timeout} 秒）。")
+             # 修改日志，明确是 wait_for 超时
+             logger.error(f"asyncio.wait_for 在等待 mcp_session.call_tool('{tool_name}') 时超时（超过 {tool_timeout} 秒）。")
              return {"error": f"调用工具 '{tool_name}' 超时 (超过 {tool_timeout} 秒)。请尝试简化查询或稍后再试。"}
         except Exception as e:
-            logger.exception(f"Agent Core: 调用 MCP 工具 '{tool_name}' 时发生意外错误。")
+            # 添加日志，记录调用时发生的异常
+            logger.exception(f"调用 mcp_session.call_tool('{tool_name}') 时或处理结果时发生异常。")
             return {"error": f"调用工具 '{tool_name}' 时发生内部错误: {type(e).__name__}"}
 
     async def _generate_final_response(self, user_input: str, plan: dict | None, tool_result: dict | None) -> str:
