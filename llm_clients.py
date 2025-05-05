@@ -62,6 +62,13 @@ class BaseLLMClient(ABC):
         return None
 
 class CompatibleOpenAIClient(BaseLLMClient):
+    def __init__(self, api_key: str, default_model: str = None, base_url: str = None):
+        self.api_key = api_key
+        self.default_model = default_model
+        self.base_url = base_url
+        self.client = None
+        logger.info(f"[CompatibleOpenAIClient] 初始化客户端: base_url={base_url}, default_model={default_model}")
+
     def _initialize_client(self):
         if not AsyncOpenAI:
             logger.error("OpenAI SDK (>=1.0) 未安装。请运行 'pip install --upgrade openai'")
@@ -79,7 +86,15 @@ class CompatibleOpenAIClient(BaseLLMClient):
     async def generate_text(self, prompt: str, model: str | None = None, system_prompt: str | None = None, temperature: float = 0.7, max_tokens: int = 1024, **kwargs) -> str:
         if not self.client:
             return f"错误：OpenAI 兼容客户端 (URL: {self.base_url}) 未初始化。"
+
+        logger.debug(f"[generate_text] Received model argument: {model}")
+        logger.debug(f"[generate_text] Client's default_model: {self.default_model}")
+
         target_model = model or self.default_model or "gpt-3.5-turbo"
+
+        logger.info(f"[generate_text] Attempting to use target_model: '{target_model}'")
+        logger.info(f"[generate_text] Client Base URL: {self.base_url}")
+        logger.info(f"[generate_text] API Key set for this client: {bool(self.api_key)}")
 
         messages = []
         if system_prompt:
@@ -87,7 +102,7 @@ class CompatibleOpenAIClient(BaseLLMClient):
         messages.append({"role": "user", "content": prompt})
 
         try:
-            logger.debug(f"向 {self.base_url} 发送请求: model={target_model}, messages={messages}")
+            logger.debug(f"向 {self.base_url} 发送请求: model={target_model}, messages (部分)={str(messages)[:200]}")
             response = await self.client.chat.completions.create(
                 model=target_model,
                 messages=messages,
@@ -95,21 +110,10 @@ class CompatibleOpenAIClient(BaseLLMClient):
                 max_tokens=max_tokens,
                 **kwargs
             )
-            result = response.choices[0].message.content
-            logger.debug(f"从 {self.base_url} 收到响应: {result[:100]}...")
-            return result or ""
-        except APIError as e:
-            logger.exception(f"调用 OpenAI 兼容 API ({self.base_url}) 时发生 API 错误: {e.status_code} - {e.message}")
-            return f"错误：API 调用失败 ({e.status_code}) - {e.message}"
-        except RateLimitError as e:
-            logger.exception(f"调用 OpenAI 兼容 API ({self.base_url}) 时触发速率限制。")
-            return "错误：请求过于频繁，请稍后再试。"
-        except APIConnectionError as e:
-            logger.exception(f"无法连接到 OpenAI 兼容 API ({self.base_url})。")
-            return f"错误：无法连接到服务 ({self.base_url})。"
+            return response.choices[0].message.content
         except Exception as e:
-            logger.exception(f"调用 OpenAI 兼容 API ({self.base_url}) 时发生未知错误: {e}")
-            return f"错误：调用 API 时发生未知错误 ({type(e).__name__})"
+            logger.error(f"LLM API 调用失败: {str(e)}")
+            return f"LLM API 调用失败: {str(e)}"
 
 class AnthropicClient(BaseLLMClient):
     def _initialize_client(self):
@@ -206,30 +210,34 @@ class GoogleClient(BaseLLMClient):
             error_message = str(e)
             return f"错误：调用 Google Gemini API 失败 ({type(e).__name__}): {error_message}"
 
-def get_llm_client(provider_name: str = config.DEFAULT_LLM_PROVIDER) -> BaseLLMClient | None:
-    provider = provider_name.lower()
-    api_key = None
-    base_url = None
-    default_model = None
-
+def get_llm_client(provider: str = None) -> BaseLLMClient | None:
+    """获取 LLM 客户端实例"""
+    provider = provider or config.DEFAULT_LLM_PROVIDER
+    logger.info(f"[get_llm_client] 开始创建 LLM 客户端，provider={provider}")
+    
     if provider == "openai":
         api_key = config.OPENAI_API_KEY
-        base_url = None
+        base_url = config.OPENAI_API_BASE
         default_model = config.DEFAULT_LLM_MODEL or "gpt-3.5-turbo"
+        logger.info(f"[get_llm_client] OpenAI 配置: base_url={base_url}, default_model={default_model}")
         return CompatibleOpenAIClient(api_key=api_key, default_model=default_model, base_url=base_url)
-
-    elif provider == "aihubmix":
-        api_key = config.AIHUBMIX_API_KEY
-        base_url = "https://aihubmix.com/v1"
-        default_model = config.DEFAULT_LLM_MODEL or "gpt-4o-mini"
-        return CompatibleOpenAIClient(api_key=api_key, default_model=default_model, base_url=base_url)
-
     elif provider == "deepseek":
         api_key = config.DEEPSEEK_API_KEY
         base_url = "https://api.deepseek.com/v1"
         default_model = config.DEFAULT_LLM_MODEL or "deepseek-chat"
+        logger.info(f"[get_llm_client] Configuring DeepSeek client:")
+        logger.info(f"[get_llm_client]   Provider: {provider}")
+        logger.info(f"[get_llm_client]   API Key Provided: {bool(api_key)}")
+        logger.info(f"[get_llm_client]   Base URL: {base_url}")
+        logger.info(f"[get_llm_client]   Config DEFAULT_LLM_MODEL: {config.DEFAULT_LLM_MODEL}")
+        logger.info(f"[get_llm_client]   Resolved default_model for client: {default_model}")
         return CompatibleOpenAIClient(api_key=api_key, default_model=default_model, base_url=base_url)
-
+    elif provider == "aihubmix":
+        api_key = config.AIHUBMIX_API_KEY
+        base_url = "https://api.aihubmix.com/v1"
+        default_model = config.DEFAULT_LLM_MODEL or "gpt-3.5-turbo"
+        logger.info(f"[get_llm_client] AIHUBMIX 配置: base_url={base_url}, default_model={default_model}")
+        return CompatibleOpenAIClient(api_key=api_key, default_model=default_model, base_url=base_url)
     elif provider == "ark" or provider == "volcengine":
         api_key = config.ARK_API_KEY
         base_url = config.ARK_BASE_URL or "https://ark.cn-beijing.volces.com/api/v3/"
@@ -238,13 +246,10 @@ def get_llm_client(provider_name: str = config.DEFAULT_LLM_PROVIDER) -> BaseLLMC
             logger.error("请在配置中为火山方舟 (ARK) 提供有效的模型 ID 或 Endpoint ID。")
             return None
         return CompatibleOpenAIClient(api_key=api_key, default_model=default_model, base_url=base_url)
-
     elif provider == "anthropic":
         return AnthropicClient(api_key=config.ANTHROPIC_API_KEY, default_model=config.DEFAULT_LLM_MODEL)
-
     elif provider == "google":
         return GoogleClient(api_key=config.GOOGLE_API_KEY, default_model=config.DEFAULT_LLM_MODEL)
-
     else:
-        logger.error(f"不支持的 LLM 提供商: {provider_name}")
+        logger.error(f"不支持的 LLM 提供商: {provider}")
         return None
