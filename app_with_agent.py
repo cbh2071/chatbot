@@ -2,7 +2,7 @@
 import gradio as gr
 import logging
 import asyncio
-import atexit
+# import atexit # atexit 是同步的，对于异步清理可能不够用
 from typing import List, Tuple, Optional
 
 # 配置日志
@@ -19,6 +19,7 @@ except ImportError as e:
 
 # --- 全局 Agent 实例 (应用级别单例) ---
 try:
+     # AgentCore 的初始化现在是同步的，但启动是异步的
      agent = AgentCore(llm_provider=config.DEFAULT_LLM_PROVIDER)
 except ValueError as e:
      logger.error(f"初始化 AgentCore 失败: {e}")
@@ -111,7 +112,6 @@ with gr.Blocks(title=title, theme=gr.themes.Default()) as demo:
             outputs=[msg_textbox, chatbot]
         )
 
-
     # 处理清空按钮点击
     clear_btn.click(
         fn=clear_history_globally,
@@ -120,17 +120,29 @@ with gr.Blocks(title=title, theme=gr.themes.Default()) as demo:
     )
 
 # --- 应用生命周期 ---
-def shutdown_agent():
-    """在应用退出时关闭 Agent Core。"""
-    logger.info("Gradio 应用关闭，正在关闭 Agent Core...")
-    agent.shutdown() # agent 是全局变量
+async def startup_event():
+    """应用启动时异步启动 Agent."""
+    logger.info("Gradio 应用启动，正在异步启动 AgentCore MCP 客户端...")
+    if not await agent.start():
+         logger.error("严重错误: AgentCore 在应用启动时启动 MCP 失败。")
+         # 可在 UI 中提示用户服务可能不可用
+
+async def shutdown_event():
+    """应用关闭时异步停止 Agent."""
+    logger.info("Gradio 应用关闭，正在异步停止 AgentCore...")
+    await agent.stop()
 
 if __name__ == "__main__":
-    # 注册退出时的清理函数
-    atexit.register(shutdown_agent)
+    async def main():
+        await startup_event()
+        try:
+            await demo.launch(share=False)
+        finally:
+            await shutdown_event()
 
-    # 启动 Gradio 应用
     logger.info("正在启动 Gradio Blocks 聊天界面...")
-    # 运行 Blocks 实例
-    demo.launch(share=True) # 使用 share=True 获取公共链接
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("收到 Ctrl+C，准备关闭...")
     logger.info("Gradio 界面已关闭。")

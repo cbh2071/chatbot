@@ -2,35 +2,101 @@
 import logging
 import json
 import asyncio
-from typing import List, Dict, Any, Tuple
+import subprocess # 需要启动子进程
+import sys
+import os
+import contextlib # 用于 AsyncExitStack
+from typing import List, Dict, Any, Optional, Tuple
 
 import config                   # 导入配置
 from llm_clients import get_llm_client, BaseLLMClient # 导入 LLM 客户端工厂和基类
-from mcp_clients import get_mcp_client, SimpleMcpStdioClient # 导入 MCP 客户端工厂和实现
+
+# 导入官方 MCP Client 相关库
+from mcp import ClientSession, StdioServerParameters, types as mcp_types
+from mcp.client.stdio import stdio_client
 
 logger = logging.getLogger(__name__)
 
 class AgentCore:
-    """智能代理核心类，负责处理用户输入、调用LLM和MCP工具、生成回复。"""
+    """智能代理核心类，使用官方 MCP SDK 与后台工具交互。"""
 
-    def __init__(self, llm_provider: str = config.DEFAULT_LLM_PROVIDER, mcp_client_instance: SimpleMcpStdioClient | None = None):
-        """
-        初始化 AgentCore。
-        :param llm_provider: 要使用的 LLM 提供商名称 (例如 "openai", "anthropic")。
-        :param mcp_client_instance: 外部传入的 MCP 客户端实例 (可选)。如果未提供，则内部创建一个。
-        """
+    def __init__(self, llm_provider: str = config.DEFAULT_LLM_PROVIDER):
         self.llm_client: BaseLLMClient | None = get_llm_client(llm_provider)
         if not self.llm_client:
             raise ValueError(f"无法初始化 LLM 客户端: {llm_provider}")
 
-        self.mcp_client = mcp_client_instance or get_mcp_client()
-        # 确保 MCP 服务器在 Agent Core 启动时启动
-        if not self.mcp_client.start():
-             logger.warning("AgentCore 初始化时启动 MCP 客户端失败，后续工具调用可能失败。")
+        # MCP 相关状态
+        self.mcp_process: Optional[subprocess.Popen] = None
+        self.mcp_session: Optional[ClientSession] = None
+        # AsyncExitStack 用于优雅地管理异步上下文资源 (如 stdio_client)
+        self.mcp_exit_stack: contextlib.AsyncExitStack = contextlib.AsyncExitStack()
+        self.mcp_server_script = config.MCP_SERVER_SCRIPT # 从配置中获取脚本路径
 
-        self.conversation_history: List[Dict[str, str]] = [] # 存储对话历史 [{ "role": "user/assistant", "content": "..." }]
+        self.conversation_history: List[Dict[str, str]] = []
+        self._mcp_ready = asyncio.Event() # 用于指示 MCP 客户端是否准备就绪
 
-        logger.info(f"AgentCore 初始化完成，使用 LLM 提供商: {llm_provider}，MCP 客户端: {type(self.mcp_client).__name__}")
+        logger.info(f"AgentCore 初始化，使用 LLM: {llm_provider}，准备启动 MCP 客户端...")
+
+    async def start(self):
+        """启动 Agent Core，包括启动和连接 MCP 客户端。"""
+        if self.mcp_session and not self.mcp_session.is_closing:
+            logger.info("MCP 客户端已在运行。")
+            return True
+
+        logger.info("正在启动 MCP 客户端...")
+        try:
+            server_params = StdioServerParameters(
+                command=sys.executable, # 使用当前 python 解释器
+                args=[self.mcp_server_script], # 要运行的服务器脚本
+                cwd=os.path.dirname(os.path.abspath(__file__)), # 在当前目录运行
+            )
+
+            # 使用 AsyncExitStack 管理 stdio_client 的上下文
+            streams = await self.mcp_exit_stack.enter_async_context(stdio_client(server_params))
+
+            # 使用获取到的流创建 ClientSession
+            self.mcp_session = await self.mcp_exit_stack.enter_async_context(
+                ClientSession(streams[0], streams[1]) # streams[0] is read, streams[1] is write
+            )
+
+            # 初始化 MCP 连接 (握手)
+            await self.mcp_session.initialize()
+            server_caps = self.mcp_session.server_capabilities
+            logger.info(f"MCP 连接成功。服务器能力: {server_caps}")
+            self._mcp_ready.set() # 标记 MCP 已就绪
+            return True
+
+        except Exception as e:
+            logger.exception("启动 MCP 客户端失败!")
+            await self.stop() # 尝试清理
+            self._mcp_ready.clear()
+            return False
+
+    async def stop(self):
+        """停止 Agent Core，关闭 MCP 客户端和子进程。"""
+        logger.info("正在停止 MCP 客户端...")
+        self._mcp_ready.clear()
+        await self.mcp_exit_stack.aclose()
+        self.mcp_session = None
+        if self.mcp_process and self.mcp_process.poll() is None:
+             logger.warning("MCP 进程在 exit stack 清理后仍在运行，尝试强制终止。")
+             try:
+                 self.mcp_process.terminate()
+                 self.mcp_process.wait(timeout=1)
+             except:
+                 self.mcp_process.kill()
+        self.mcp_process = None
+        logger.info("MCP 客户端已停止。")
+
+    async def _ensure_mcp_ready(self) -> bool:
+         """确保 MCP 客户端已就绪，如果未就绪则尝试启动。"""
+         if not self._mcp_ready.is_set():
+             logger.warning("MCP 客户端未就绪，尝试启动...")
+             if not await self.start():
+                 logger.error("无法启动 MCP 客户端。")
+                 return False
+             await asyncio.sleep(0.5)
+         return self._mcp_ready.is_set()
 
     def _format_history(self) -> str:
         """将对话历史格式化为字符串，供 LLM prompt 使用。"""
@@ -43,9 +109,6 @@ class AgentCore:
     async def _plan_execution(self, user_input: str) -> dict | None:
         """
         使用 LLM 进行规划：分析用户意图，决定是否调用 MCP 工具及所需参数。
-        :param user_input: 当前用户的输入。
-        :return: 包含规划结果的字典 (例如 {"action": "call_tool", "tool_name": "...", "arguments": {...}} 或 {"action": "direct_response"})，
-                 如果规划失败则返回 None。
         """
         history_str = self._format_history()
         system_prompt = f"""你是一个生物信息学助手。你的任务是理解用户的请求，并决定下一步行动。
@@ -75,14 +138,13 @@ class AgentCore:
 
         请根据用户最新请求进行规划，并以 JSON 格式输出你的决策。"""
         logger.info("Agent Core: 开始规划阶段...")
-        logger.debug(f"规划 Prompt (部分): {system_prompt[:500]}...") # 记录部分 prompt
+        logger.debug(f"规划 Prompt (部分): {system_prompt[:500]}...")
 
-        # 调用 LLM 生成 JSON 格式的规划
         plan = await self.llm_client.generate_json(
-            prompt=f"用户最新请求: {user_input}", # 实际的用户输入放入 main prompt
+            prompt=f"用户最新请求: {user_input}",
             system_prompt=system_prompt,
-            temperature=0.1, # 规划阶段需要更精确
-            max_tokens=512 # 限制输出长度
+            temperature=0.1,
+            max_tokens=512
         )
 
         if plan and isinstance(plan, dict) and "action" in plan:
@@ -94,26 +156,55 @@ class AgentCore:
 
     async def _execute_tool(self, tool_name: str, arguments: dict) -> dict:
         """
-        通过 MCP 客户端调用指定的工具。
+        通过官方 MCP ClientSession 调用指定的工具。
         :param tool_name: 要调用的工具名称。
         :param arguments: 传递给工具的参数。
         :return: 工具返回的结果字典，或包含 'error' 的字典。
         """
+        if not await self._ensure_mcp_ready():
+             return {"error": "MCP 客户端不可用，无法执行工具。"}
+
         if tool_name not in config.AVAILABLE_MCP_TOOLS:
             logger.error(f"Agent Core: 尝试调用未定义的工具 '{tool_name}'。")
             return {"error": f"内部错误：工具 '{tool_name}' 未定义。"}
 
         logger.info(f"Agent Core: 开始执行工具 '{tool_name}'，参数: {arguments}")
-        # **重要:** 在实际调用前，应该根据 AVAILABLE_MCP_TOOLS 中的定义严格验证参数是否存在、是否必需、类型是否匹配。
-        # 这里暂时省略了详细的参数验证逻辑。
 
         try:
-            # 调用 MCP 客户端的 call_tool 方法
-            # 注意：这里的 timeout 可能需要根据工具的预期执行时间调整
-            result = await self.mcp_client.call_tool(method=tool_name, params=arguments, timeout=60.0)
+            result: mcp_types.CallToolResult = await self.mcp_session.call_tool(
+                name=tool_name,
+                arguments=arguments
+            )
             logger.info(f"Agent Core: 工具 '{tool_name}' 执行完成。")
-            logger.debug(f"工具 '{tool_name}' 返回结果: {result}")
-            return result if isinstance(result, dict) else {"error": "工具返回了无效的格式。"}
+
+            if result.isError:
+                error_content = result.content[0].text if result.content and isinstance(result.content[0], mcp_types.TextContent) else "未知工具错误"
+                logger.error(f"MCP 工具 '{tool_name}' 返回错误: {error_content}")
+                return {"error": f"工具执行错误: {error_content}"}
+            else:
+                if result.content and len(result.content) == 1:
+                    content_item = result.content[0]
+                    if isinstance(content_item, mcp_types.TextContent) and content_item.text:
+                        try:
+                            parsed_result = json.loads(content_item.text)
+                            logger.debug(f"工具 '{tool_name}' 返回结果 (解析后): {parsed_result}")
+                            return parsed_result
+                        except json.JSONDecodeError:
+                            logger.warning(f"工具 '{tool_name}' 返回了非 JSON 文本，直接使用。")
+                            return {"result_text": content_item.text}
+                    elif isinstance(content_item, mcp_types.DictContent):
+                         logger.debug(f"工具 '{tool_name}' 返回结果: {content_item.model_dump()}")
+                         return content_item.model_dump()
+                    else:
+                         logger.warning(f"工具 '{tool_name}' 返回了未预期的内容类型或空内容。")
+                         return {"warning": "工具返回了非预期格式的内容。"}
+                else:
+                    logger.warning(f"工具 '{tool_name}' 返回了多个内容项或无内容。")
+                    return {"success": True, "raw_content": result.content}
+
+        except asyncio.TimeoutError:
+             logger.error(f"调用 MCP 工具 '{tool_name}' 超时。")
+             return {"error": f"调用工具 '{tool_name}' 超时。"}
         except Exception as e:
             logger.exception(f"Agent Core: 调用 MCP 工具 '{tool_name}' 时发生意外错误。")
             return {"error": f"调用工具 '{tool_name}' 时发生内部错误: {type(e).__name__}"}
@@ -121,10 +212,6 @@ class AgentCore:
     async def _generate_final_response(self, user_input: str, plan: dict | None, tool_result: dict | None) -> str:
         """
         使用 LLM 生成最终给用户的回复。
-        :param user_input: 用户的原始输入。
-        :param plan: 规划阶段的结果 (可能为 None)。
-        :param tool_result: 工具执行的结果 (如果调用了工具，可能包含错误)。
-        :return: 生成的自然语言回复。
         """
         history_str = self._format_history()
         system_prompt = "你是一个友好且专业的生物信息学助手。根据提供的上下文信息，生成一个清晰、准确且自然的回复给用户。"
@@ -136,12 +223,11 @@ class AgentCore:
         else:
              context += "助手规划阶段失败。\n\n"
 
-
         if tool_result:
-            context += f"工具执行结果:\n```json\n{json.dumps(tool_result, indent=2, ensure_ascii=False)}\n```\n\n"
+            tool_result_str = json.dumps(tool_result, indent=2, ensure_ascii=False, default=str)
+            context += f"工具执行结果:\n```json\n{tool_result_str}\n```\n\n"
         elif plan and plan.get("action") == "call_tool":
              context += "工具调用未执行或失败。\n\n"
-
 
         final_prompt = context + "请基于以上所有信息，生成给用户的最终回复。"
 
@@ -149,9 +235,8 @@ class AgentCore:
         logger.debug(f"最终回复 Prompt (部分): {final_prompt[:500]}...")
 
         response = await self.llm_client.generate_text(
-            prompt=final_prompt, # 将完整上下文作为 prompt
-            # system_prompt=system_prompt, # 或者保持 system_prompt 简洁，把指导放入主 prompt
-            temperature=0.7, # 回复生成可以更有创造性一点
+            prompt=final_prompt,
+            temperature=0.7,
             max_tokens=1024
         )
         logger.info("Agent Core: 最终回复生成完毕。")
@@ -160,50 +245,45 @@ class AgentCore:
     async def process_message(self, user_input: str) -> str:
         """
         处理单条用户消息的完整流程。
-        :param user_input: 用户输入的文本。
-        :return: Agent 生成的回复文本。
         """
         logger.info(f"Agent Core: 收到用户消息: {user_input}")
-        # 1. 将用户消息添加到历史记录
+        if not await self._ensure_mcp_ready():
+            return "抱歉，后台服务暂时遇到问题，请稍后再试。"
+
         self.conversation_history.append({"role": "user", "content": user_input})
 
-        # 2. 规划阶段
         plan = await self._plan_execution(user_input)
 
         tool_result = None
-        # 3. 执行阶段 (如果需要调用工具)
         if plan and plan.get("action") == "call_tool":
             tool_name = plan.get("tool_name")
             arguments = plan.get("arguments")
-            if tool_name and isinstance(arguments, dict):
-                tool_result = await self._execute_tool(tool_name, arguments)
-            else:
-                logger.error("Agent Core: 规划需要调用工具，但工具名称或参数无效。")
-                tool_result = {"error": "内部规划错误：无法确定要调用的工具或参数。"}
-                # 可以选择让 LLM 基于这个错误生成回复，或者直接返回错误
-                # 这里我们让 LLM 尝试处理
-        elif not plan:
-             # 规划失败的情况
-             logger.error("Agent Core: 规划阶段失败，无法确定下一步行动。")
-             # 可以生成一个表示内部错误的回复，或者让 LLM 尝试通用回复
-             # pass # 让 _generate_final_response 处理 plan is None 的情况
+            tool_info = config.AVAILABLE_MCP_TOOLS.get(tool_name)
+            missing_required = []
+            if tool_info and isinstance(tool_info.get("parameters"), dict):
+                for param_name, param_details in tool_info["parameters"].items():
+                    if param_details.get("required") and param_name not in arguments:
+                        missing_required.append(param_name)
 
-        # 4. 响应生成阶段
+            if missing_required:
+                 logger.warning(f"规划调用工具 '{tool_name}' 但缺少必需参数: {missing_required}。将要求用户提供。")
+                 plan["action"] = "ask_user"
+                 plan["missing_params"] = missing_required
+                 tool_result = {"error": f"需要更多信息才能执行 '{tool_name}'。缺少参数: {', '.join(missing_required)}"}
+            else:
+                tool_result = await self._execute_tool(tool_name, arguments)
+
+        elif not plan:
+             logger.error("Agent Core: 规划阶段失败，无法确定下一步行动。")
+             tool_result = {"error": "无法理解您的请求或制定计划。"}
+
         final_response = await self._generate_final_response(user_input, plan, tool_result)
 
-        # 5. 将助手回复添加到历史记录
         self.conversation_history.append({"role": "assistant", "content": final_response})
 
-        # 6. 返回最终回复
         return final_response
 
     def clear_history(self):
         """清空对话历史。"""
         self.conversation_history = []
         logger.info("Agent Core: 对话历史已清空。")
-
-    def shutdown(self):
-         """关闭 Agent Core，停止 MCP 客户端。"""
-         logger.info("Agent Core: 正在关闭...")
-         self.mcp_client.stop()
-         logger.info("Agent Core: 已关闭。")
