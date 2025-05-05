@@ -76,8 +76,8 @@ graph LR
 
 1.  **克隆仓库 (Clone Repository):**
     ```bash
-    git clone https://github.com/your-username/your-repo-name.git
-    cd your-repo-name
+    git clone https://github.com/cbh2071/chatbot.git
+    cd chatbot
     ```
 
 2.  **创建并激活 Python 环境 (Create & Activate Environment):** (推荐使用 `venv` 或 `conda`)
