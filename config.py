@@ -55,3 +55,6 @@ AVAILABLE_MCP_TOOLS = {
 
 # 将工具描述转换为 JSON 字符串
 AVAILABLE_MCP_TOOLS_JSON = json.dumps(AVAILABLE_MCP_TOOLS, indent=2, ensure_ascii=False)
+
+print("DEBUG: config.DEFAULT_LLM_PROVIDER =", DEFAULT_LLM_PROVIDER)
+print("DEBUG: config.DEFAULT_LLM_MODEL =", DEFAULT_LLM_MODEL)

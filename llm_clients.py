@@ -11,8 +11,6 @@ from anthropic import Anthropic, AsyncAnthropic
 import google.generativeai as genai
 import config # 导入配置
 
-import config
-
 logger = logging.getLogger(__name__)
 
 class BaseLLMClient(ABC):
@@ -68,33 +66,43 @@ class CompatibleOpenAIClient(BaseLLMClient):
         self.base_url = base_url
         self.client = None
         logger.info(f"[CompatibleOpenAIClient] 初始化客户端: base_url={base_url}, default_model={default_model}")
+        self.client = self._initialize_client()  # 立即初始化客户端
 
     def _initialize_client(self):
+        logger.info(f"[_initialize_client] 尝试初始化客户端，目标 base_url: {self.base_url}")
+        
         if not AsyncOpenAI:
-            logger.error("OpenAI SDK (>=1.0) 未安装。请运行 'pip install --upgrade openai'")
+            logger.error("[_initialize_client] 错误：AsyncOpenAI 类未找到。请确保 'openai>=1.0' 已安装。")
             return None
+
         if not self.api_key:
-            logger.warning(f"当前服务商 ({self.base_url}) 的 API 密钥未在配置中提供。")
+            logger.error(f"[_initialize_client] 错误：API Key 未提供，但服务 (URL: {self.base_url}) 需要 API Key。")
+            return None
 
         try:
-            logger.info(f"初始化 OpenAI 兼容客户端: base_url='{self.base_url}', 使用 API Key: {'是' if self.api_key else '否'}")
-            return AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+            key_status = '已提供' if self.api_key else '缺失'
+            logger.info(f"[_initialize_client] 进入 try 块。API Key 状态: {key_status}, Base URL: {self.base_url}")
+
+            client_instance = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+            logger.info(f"[_initialize_client] AsyncOpenAI 客户端实例为 {self.base_url} 创建成功。")
+            return client_instance
+
         except Exception as e:
+            logger.error(f"[_initialize_client] 在为 {self.base_url} 初始化 AsyncOpenAI 时发生 EXCEPTION。")
             logger.exception(f"初始化 OpenAI 兼容客户端失败 (base_url={self.base_url}): {e}")
             return None
 
     async def generate_text(self, prompt: str, model: str | None = None, system_prompt: str | None = None, temperature: float = 0.7, max_tokens: int = 1024, **kwargs) -> str:
+        if self.client is None:
+            logger.error(f"[generate_text] 检测到 self.client 为 None (对于 base_url: {self.base_url})。返回初始化错误。")
+        else:
+            logger.debug(f"[generate_text] 检测到 self.client 已初始化 (对于 base_url: {self.base_url})。")
+
         if not self.client:
             return f"错误：OpenAI 兼容客户端 (URL: {self.base_url}) 未初始化。"
 
-        logger.debug(f"[generate_text] Received model argument: {model}")
-        logger.debug(f"[generate_text] Client's default_model: {self.default_model}")
-
-        target_model = model or self.default_model or "gpt-3.5-turbo"
-
-        logger.info(f"[generate_text] Attempting to use target_model: '{target_model}'")
-        logger.info(f"[generate_text] Client Base URL: {self.base_url}")
-        logger.info(f"[generate_text] API Key set for this client: {bool(self.api_key)}")
+        target_model = model or self.default_model or "deepseek-chat"
+        logger.info(f"[generate_text] 尝试使用的 target_model: '{target_model}' (来自参数: {model}, 实例默认: {self.default_model})")
 
         messages = []
         if system_prompt:
@@ -213,30 +221,38 @@ class GoogleClient(BaseLLMClient):
 def get_llm_client(provider: str = None) -> BaseLLMClient | None:
     """获取 LLM 客户端实例"""
     provider = provider or config.DEFAULT_LLM_PROVIDER
-    logger.info(f"[get_llm_client] 开始创建 LLM 客户端，provider={provider}")
+    logger.info(f"[get_llm_client] 工厂函数被调用，请求的 provider: '{provider}'")
     
     if provider == "openai":
         api_key = config.OPENAI_API_KEY
         base_url = config.OPENAI_API_BASE
         default_model = config.DEFAULT_LLM_MODEL or "gpt-3.5-turbo"
-        logger.info(f"[get_llm_client] OpenAI 配置: base_url={base_url}, default_model={default_model}")
+        logger.info(f"[get_llm_client] 配置 OpenAI 客户端...")
+        logger.info(f"[get_llm_client]   OPENAI_API_KEY 是否已提供: {bool(api_key)}")
+        logger.info(f"[get_llm_client]   Base URL: {base_url}")
+        logger.info(f"[get_llm_client]   从 config 读取的 DEFAULT_LLM_MODEL: {config.DEFAULT_LLM_MODEL}")
+        logger.info(f"[get_llm_client]   最终解析得到的 default_model: {default_model}")
         return CompatibleOpenAIClient(api_key=api_key, default_model=default_model, base_url=base_url)
     elif provider == "deepseek":
         api_key = config.DEEPSEEK_API_KEY
         base_url = "https://api.deepseek.com/v1"
         default_model = config.DEFAULT_LLM_MODEL or "deepseek-chat"
-        logger.info(f"[get_llm_client] Configuring DeepSeek client:")
+        logger.info(f"[get_llm_client] 正在配置 DeepSeek 客户端:")
         logger.info(f"[get_llm_client]   Provider: {provider}")
-        logger.info(f"[get_llm_client]   API Key Provided: {bool(api_key)}")
+        logger.info(f"[get_llm_client]   DEEPSEEK_API_KEY 是否已提供: {bool(api_key)}")
         logger.info(f"[get_llm_client]   Base URL: {base_url}")
-        logger.info(f"[get_llm_client]   Config DEFAULT_LLM_MODEL: {config.DEFAULT_LLM_MODEL}")
-        logger.info(f"[get_llm_client]   Resolved default_model for client: {default_model}")
+        logger.info(f"[get_llm_client]   从 config 读取的 DEFAULT_LLM_MODEL: {config.DEFAULT_LLM_MODEL}")
+        logger.info(f"[get_llm_client]   最终解析得到的 default_model: {default_model}")
         return CompatibleOpenAIClient(api_key=api_key, default_model=default_model, base_url=base_url)
     elif provider == "aihubmix":
         api_key = config.AIHUBMIX_API_KEY
         base_url = "https://api.aihubmix.com/v1"
         default_model = config.DEFAULT_LLM_MODEL or "gpt-3.5-turbo"
-        logger.info(f"[get_llm_client] AIHUBMIX 配置: base_url={base_url}, default_model={default_model}")
+        logger.info(f"[get_llm_client] 配置 AIHUBMIX 客户端...")
+        logger.info(f"[get_llm_client]   AIHUBMIX_API_KEY 是否已提供: {bool(api_key)}")
+        logger.info(f"[get_llm_client]   Base URL: {base_url}")
+        logger.info(f"[get_llm_client]   从 config 读取的 DEFAULT_LLM_MODEL: {config.DEFAULT_LLM_MODEL}")
+        logger.info(f"[get_llm_client]   最终解析得到的 default_model: {default_model}")
         return CompatibleOpenAIClient(api_key=api_key, default_model=default_model, base_url=base_url)
     elif provider == "ark" or provider == "volcengine":
         api_key = config.ARK_API_KEY
@@ -251,5 +267,5 @@ def get_llm_client(provider: str = None) -> BaseLLMClient | None:
     elif provider == "google":
         return GoogleClient(api_key=config.GOOGLE_API_KEY, default_model=config.DEFAULT_LLM_MODEL)
     else:
-        logger.error(f"不支持的 LLM 提供商: {provider}")
+        logger.error(f"[get_llm_client] 不支持的 LLM 提供商: {provider}")
         return None
