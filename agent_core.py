@@ -174,10 +174,18 @@ class AgentCore:
 
         logger.info(f"Agent Core: 开始执行工具 '{tool_name}'，参数: {arguments}")
 
+        # 设置工具特定的超时时间
+        tool_timeout = 90.0 if tool_name == "search_proteins" else 30.0
+        logger.info(f"为工具 '{tool_name}' 设置超时: {tool_timeout} 秒")
+
         try:
-            result: mcp_types.CallToolResult = await self.mcp_session.call_tool(
-                name=tool_name,
-                arguments=arguments
+            # 使用 asyncio.wait_for 包装 call_tool 调用
+            result: mcp_types.CallToolResult = await asyncio.wait_for(
+                self.mcp_session.call_tool(
+                    name=tool_name,
+                    arguments=arguments
+                ),
+                timeout=tool_timeout
             )
             logger.info(f"Agent Core: 工具 '{tool_name}' 执行完成。")
 
@@ -192,23 +200,34 @@ class AgentCore:
                         try:
                             parsed_result = json.loads(content_item.text)
                             logger.debug(f"工具 '{tool_name}' 返回结果 (解析后): {parsed_result}")
+                            # 确保返回的是 List[Dict] 或 Dict[str, Any]
+                            if tool_name == "search_proteins" and not isinstance(parsed_result, list):
+                                logger.warning(f"Search tool did not return a list: {type(parsed_result)}")
+                                return {"error": "Search tool returned unexpected format."}
                             return parsed_result
                         except json.JSONDecodeError:
                             logger.warning(f"工具 '{tool_name}' 返回了非 JSON 文本，直接使用。")
                             return {"result_text": content_item.text}
-                    elif isinstance(content_item, mcp_types.DictContent):
-                         logger.debug(f"工具 '{tool_name}' 返回结果: {content_item.model_dump()}")
-                         return content_item.model_dump()
+                    elif hasattr(content_item, 'model_dump') and callable(content_item.model_dump):
+                         logger.debug(f"工具 '{tool_name}' 返回结果 (Pydantic): {content_item.model_dump()}")
+                         parsed_result = content_item.model_dump()
+                         if tool_name == "search_proteins" and not isinstance(parsed_result, list):
+                              logger.warning(f"Search tool did not return a list: {type(parsed_result)}")
+                              return {"error": "Search tool returned unexpected format."}
+                         return parsed_result
                     else:
                          logger.warning(f"工具 '{tool_name}' 返回了未预期的内容类型或空内容。")
                          return {"warning": "工具返回了非预期格式的内容。"}
+                elif tool_name == "search_proteins" and not result.content:
+                     logger.info(f"工具 '{tool_name}' 成功执行但未返回任何内容 (可能是搜索无结果)。")
+                     return []
                 else:
-                    logger.warning(f"工具 '{tool_name}' 返回了多个内容项或无内容。")
-                    return {"success": True, "raw_content": result.content}
+                    logger.warning(f"工具 '{tool_name}' 返回了多个内容项或无内容（非搜索工具）。")
+                    return {"success": True, "raw_content": "Complex or empty content"}
 
         except asyncio.TimeoutError:
-             logger.error(f"调用 MCP 工具 '{tool_name}' 超时。")
-             return {"error": f"调用工具 '{tool_name}' 超时。"}
+             logger.error(f"调用 MCP 工具 '{tool_name}' 超时（超过 {tool_timeout} 秒）。")
+             return {"error": f"调用工具 '{tool_name}' 超时 (超过 {tool_timeout} 秒)。请尝试简化查询或稍后再试。"}
         except Exception as e:
             logger.exception(f"Agent Core: 调用 MCP 工具 '{tool_name}' 时发生意外错误。")
             return {"error": f"调用工具 '{tool_name}' 时发生内部错误: {type(e).__name__}"}

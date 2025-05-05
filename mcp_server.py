@@ -173,17 +173,16 @@ async def _perform_uniprot_search(query: str, species_filter: Optional[str], key
 @mcp.tool()
 async def search_proteins(query: str, species_filter: Optional[str] = None, keyword_filter: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]] | Dict[str, Any]:
     """
-    根据关键词、物种等条件在 UniProt 数据库中搜索蛋白质。
-
-    Args:
-        query: 必需，搜索关键词（如基因名、功能描述等）。
-        species_filter: 可选，物种科学名称 (如 "Homo sapiens") 或 NCBI 分类 ID (如 9606) 进行过滤。
-        keyword_filter: 可选，使用 UniProt 关键字 (如 "Kinase") 进行过滤。
-        limit: 可选，限制返回结果的数量，默认为 10，最大为 50。
-
-    Returns:
-        包含蛋白质列表的数组，每个蛋白质是一个包含 'id', 'entry_name', 'name', 'organism', 'length' 等信息的对象；或在出错时包含 'error' 的字典。
+    搜索 UniProt 数据库中的蛋白质。
+    :param query: 搜索关键词
+    :param species_filter: 可选的物种过滤条件
+    :param keyword_filter: 可选的额外关键词过滤
+    :param limit: 返回结果的最大数量
+    :return: 包含蛋白质信息的列表
     """
+    # 添加紧急调试打印
+    print(f"DEBUG: ENTER search_proteins: query='{query}', species='{species_filter}', keyword='{keyword_filter}', limit={limit}", file=sys.stderr, flush=True)
+    
     logger.info(f"Tool 'search_proteins' called with query: '{query}', species: {species_filter}, keyword: {keyword_filter}, limit: {limit}")
     try:
         # 添加基本的输入验证和限制
