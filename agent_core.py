@@ -59,10 +59,14 @@ class AgentCore:
                 ClientSession(streams[0], streams[1]) # streams[0] is read, streams[1] is write
             )
 
-            # 初始化 MCP 连接 (握手)
-            await self.mcp_session.initialize()
-            server_caps = self.mcp_session.server_capabilities
-            logger.info(f"MCP 连接成功。服务器能力: {server_caps}")
+            # 初始化 MCP 连接 (握手)，并捕获返回结果
+            init_result = await self.mcp_session.initialize()
+
+            # 从返回结果中获取服务器能力和信息
+            server_caps = init_result.capabilities
+            server_info = init_result.serverInfo # 也可以获取服务器信息
+
+            logger.info(f"MCP 连接成功。服务器: {server_info.name} v{server_info.version}, 能力: {server_caps}")
             self._mcp_ready.set() # 标记 MCP 已就绪
             return True
 
