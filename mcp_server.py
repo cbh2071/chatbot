@@ -1,108 +1,72 @@
 # mcp_server.py
-import sys     # 导入sys库，用于访问标准输入/输出/错误流和退出程序
-import logging # 导入logging库
-import asyncio # 导入asyncio库
-import os      # 导入os库，用于获取进程ID
-from typing import Dict, Any, List
+import logging
+import sys
+import os
+import asyncio
+from typing import Dict, Any, List, Optional
 
-def validate_sequence(sequence: str) -> bool:
-    """验证蛋白质序列是否只包含有效的氨基酸字符"""
-    valid_chars = set("ACDEFGHIKLMNPQRSTVWY-")
-    return all(char in valid_chars for char in sequence.upper())
-
-# 确保根目录在 sys.path 中，以便导入其他模块
-# 如果你的项目结构需要，取消下面的注释并调整路径
+# 确保根目录在 sys.path 中，以便导入其他模块 (如果需要)
 # project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 # if project_root not in sys.path:
 #     sys.path.insert(0, project_root)
 
-# 尝试导入必要的模块
-try:
-    # 从mcp库导入FastMCP类，用于快速创建MCP服务器
-    from mcp.server.fastmcp import FastMCP
-    # 从我们自己的模块导入实际的预测逻辑函数
-    from model_predictor import predict_protein_function as predict_tool_impl
-    # 从我们自己的模块导入序列验证函数
-    from protein_utils import fetch_protein_data as get_data_impl
-    from protein_utils import search_proteins as search_tool_impl
-    # 从mcp.types导入用于类型提示的模块
-    import mcp.types as types
-except ImportError as e:
-    # 如果导入失败（例如，依赖未安装或路径问题），向标准错误输出错误信息
-    # 因为标准输出可能被MCP协议占用，关键错误信息应输出到stderr
-    print(f"导入模块时出错: {e}。请确保 mcp, model_predictor.py, 和 protein_utils.py 可访问且依赖已安装。", file=sys.stderr)
-    # 退出程序，返回错误码1
-    sys.exit(1)
+# 导入官方 MCP Server 实现
+from mcp.server.fastmcp import FastMCP
+# 导入 mcp.types 用于类型提示 (如果工具函数需要返回特定类型)
+# import mcp.types as types # 在这个例子中暂时不需要
 
-# 配置日志记录器，将日志输出到标准错误流(stderr)
-# 这是因为MCP通过标准输出(stdout)进行协议通信，不能被日志干扰
-logging.basicConfig(level=logging.INFO, stream=sys.stderr, format='%(asctime)s [MCP Server] %(levelname)s: %(message)s')
-# 获取名为__name__（即当前模块名'mcp_server'）的日志记录器实例
+# 导入你实际的工具函数实现
+try:
+    # 从 model_predictor 导入预测函数 (现在我们直接用这个名字)
+    from model_predictor import predict_protein_function
+    # 从 protein_utils 导入获取数据的函数
+    from protein_utils import fetch_protein_data
+    # 我们将在这里实现 search_proteins 的核心逻辑，所以不需要从外部导入
+except ImportError as e:
+    logging.error(f"无法导入工具实现所需的函数 (predict_protein_function 或 fetch_protein_data): {e}")
+    logging.error("请确保 model_predictor.py 和 protein_utils.py 在 Python 路径中，并包含正确的函数。")
+    # 定义临时的 placeholder 函数，以便服务器至少能启动
+    async def predict_protein_function(sequence: str, organism: str = "") -> Dict[str, Any]: return {"error": "Predict tool implementation not loaded"}
+    async def fetch_protein_data(identifier: str) -> Dict[str, Any] | None: return {"error": "Get data tool implementation not loaded"}
+
+# 导入 httpx 用于 UniProt API 调用
+import httpx
+import json
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [MCP Server] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-# 初始化 FastMCP 服务器实例
-# 'name' 参数定义了服务器的名称，如果与MCP客户端（如Claude Desktop）集成，这个名称需要匹配客户端配置中的名称
-# 'version' 参数定义了服务器的版本
-mcp = FastMCP(name="protein_tools_server")
+# --- 创建 FastMCP 实例 ---
+mcp = FastMCP("protein_tools_server")
 
-# 使用 @mcp.tool() 装饰器将一个异步函数注册为MCP工具
-# MCP客户端可以通过调用这个工具来执行相应的操作
+# --- 工具实现 ---
+
 @mcp.tool()
-async def predict_protein_function_tool(
-    sequence: str,      # 必需参数：蛋白质序列字符串
-    organism: str = ""  # 可选参数：来源物种的科学名称，提供额外上下文
-) -> Dict[str, Any]:
+async def predict_protein_function_tool(sequence: str, organism: str = "") -> Dict[str, Any]:
     """
-    MCP 工具：根据蛋白质的氨基酸序列预测其生物学功能。
+    根据蛋白质的氨基酸序列预测其生物学功能。
 
-    输入参数:
-        sequence (str): 必需，有效的蛋白质序列字符串。
-        organism (str): 可选，提供来源物种信息。
+    Args:
+        sequence: 必需，蛋白质的氨基酸序列。
+        organism: 可选，蛋白质来源的物种科学名称。
 
-    返回:
-        dict: 包含预测结果的字典，成功时有 'predicted_function', 'confidence', 'model_version', 'processing_time_sec' 键。
-              如果预测失败，则包含 'error' 键及错误描述。
+    Returns:
+        包含 'predicted_function', 'confidence', 'model_version', 'processing_time_sec' 的字典，或包含 'error' 的字典。
     """
-    logger.info(f"MCP 工具 'predict_protein_function_tool' 被调用。")
-
-    # 检查必需的 sequence 参数是否存在且非空
-    if not sequence:
-        logger.error("工具错误：输入的序列参数缺失或为空。")
-        # 返回一个包含错误信息的字典，符合MCP错误响应格式
-        return {"error": "参数 'sequence' 是必需的，不能为空。"}
-
-    # 在调用模型之前，先验证输入序列的格式
-    if not validate_sequence(sequence):
-         logger.error(f"工具错误：检测到无效的序列格式。序列开头: {sequence[:30]}...")
-         # 返回具体的错误信息
-         return {"error": "无效的序列格式。只允许标准的氨基酸字符 (ACDEFGHIKLMNPQRSTVWY-)。"}
-
-    logger.info(f"序列 (长度={len(sequence)}) 已通过验证。开始调用预测逻辑...")
+    logger.info(f"Tool 'predict_protein_function_tool' called with sequence length {len(sequence)}")
     try:
-        # 调用从 model_predictor 模块导入的实际预测函数
-        result = await predict_tool_impl(sequence, organism)
-
-        # 检查预测函数本身是否返回了错误（在model_predictor内部处理的错误）
+        # 直接调用导入的预测函数
+        result = await predict_protein_function(sequence, organism)
+        # 假设 predict_protein_function 内部会处理模拟/真实预测并返回字典
         if "error" in result:
-            logger.error(f"预测逻辑返回错误: {result['error']}")
-            # 将内部错误直接传递给MCP客户端
-            return result
+             logger.error(f"Prediction failed: {result.get('error')}")
         else:
-            # 预测逻辑成功完成
-            logger.info("预测逻辑成功完成。")
-            # 返回包含预测结果的字典
-            return result
-
-    # 处理任务被取消的异常
-    except asyncio.CancelledError:
-         logger.warning("预测任务被取消。")
-         return {"error": "预测被取消。"}
-    # 捕获所有其他在预测过程中可能发生的未预料异常
+             logger.info(f"Prediction successful: {result.get('predicted_function')}")
+        return result
     except Exception as e:
-        # 使用 logger.exception 记录完整的错误信息和堆栈跟踪
-        logger.exception("工具错误：预测过程中发生意外错误。")
-        # 向客户端返回一个用户友好的内部错误消息
-        return {"error": f"预测服务器内部发生错误: {type(e).__name__}"}
+        logger.exception("Unexpected error in predict_protein_function_tool")
+        return {"error": f"Internal server error during prediction: {type(e).__name__}"}
 
 @mcp.tool()
 async def get_protein_data(identifier: str) -> Dict[str, Any] | None:
@@ -113,68 +77,133 @@ async def get_protein_data(identifier: str) -> Dict[str, Any] | None:
         identifier: 必需，UniProt 登录号 (如 P00533) 或入口名称 (如 INS_HUMAN)。
 
     Returns:
-        包含 'sequence', 'organism', 'id' 等信息的字典，或在未找到时返回 null，或在出错时包含 'error' 的字典。
+        包含 'sequence', 'organism', 'id' 等信息的字典，或在未找到时返回包含 'error' 的字典，或在其他错误时也返回错误字典。
     """
     logger.info(f"Tool 'get_protein_data' called with identifier: {identifier}")
     try:
-        # 注意：fetch_protein_data 已经设计为在找不到或出错时返回 None
-        # 但 MCP 工具最好返回包含 error 的字典或引发异常，让 FastMCP 处理
-        result = await get_data_impl(identifier)
+        result = await fetch_protein_data(identifier)
         if result is None:
-            # 如果 get_data_impl 内部处理了 not found 并返回 None，我们将其转换
-            # 但更好的做法是让 get_data_impl 在找不到时引发特定异常，或直接返回含 error 的 dict
-             logger.warning(f"Identifier '{identifier}' not found or failed to fetch.")
-             # 返回 None 在 JSON-RPC 中是合法的 null 结果
-             return None # 或者 return {"error": f"Identifier '{identifier}' not found."}
-        logger.info(f"Data fetched for {identifier}: Found ID {result.get('id')}")
-        return result
+            # fetch_protein_data 在找不到或其内部出错时返回 None
+            logger.warning(f"Identifier '{identifier}' not found or failed to fetch in protein_utils.")
+            # 返回明确的错误给 Agent，而不是 None/null
+            return {"error": f"Identifier '{identifier}' not found or data could not be retrieved."}
+        else:
+             logger.info(f"Data fetched for {identifier}: Found ID {result.get('id')}")
+             return result # 返回获取到的字典
     except Exception as e:
-        logger.exception("Error in get_protein_data tool")
+        logger.exception(f"Unexpected error in get_protein_data tool for identifier {identifier}")
         return {"error": f"Internal server error fetching data for {identifier}: {type(e).__name__}"}
 
+# --- search_proteins 的核心实现 ---
+async def _perform_uniprot_search(query: str, species_filter: Optional[str], keyword_filter: Optional[str], limit: int) -> List[Dict[str, Any]]:
+    """
+    实际执行 UniProt 搜索的内部函数。
+    """
+    base_url = "https://rest.uniprot.org/uniprotkb/search"
+    # 构建查询字符串 - 注意 UniProt 查询语法
+    query_parts = [f"({query})"] # 将主查询放入括号，应对可能的复杂查询
+    if species_filter:
+        # 尝试智能判断是物种名还是分类ID
+        if species_filter.isdigit():
+            query_parts.append(f"taxonomy_id:{species_filter}")
+        else:
+            # 对于物种名，可能需要精确匹配或加引号，这里简单处理
+            # 注意：UniProt API 对物种名的查询可能需要更精确的字段，如 organism_name:"Homo sapiens"
+            query_parts.append(f"organism_name:\"{species_filter}\"") # 尝试加引号
+    if keyword_filter:
+        query_parts.append(f"keyword:{keyword_filter}")
+
+    full_query = " AND ".join(query_parts)
+    # 请求需要的字段
+    fields = "accession,id,protein_name,organism_name,length" # protein_name 可能比 id 更易读
+
+    params = {
+        "query": full_query,
+        "fields": ",".join(fields),
+        "format": "json",
+        "size": limit
+    }
+
+    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client: # 增加超时
+        try:
+            logger.debug(f"UniProt search query: {params['query']}, fields: {params['fields']}, size: {params['size']}")
+            response = await client.get(base_url, params=params)
+            response.raise_for_status() # 检查 HTTP 错误 (4xx, 5xx)
+            data = response.json()
+
+            results_list = []
+            if "results" in data:
+                for entry in data["results"]:
+                    protein_info = {
+                        "id": entry.get("primaryAccession"), # 使用 Accession 作为主要 ID
+                        "entry_name": entry.get("uniProtkbId"), # UniProt ID (e.g., EGFR_HUMAN)
+                        "name": entry.get("proteinDescription", {}).get("recommendedName", {}).get("fullName",{}).get("value", "N/A"), # 尝试获取推荐全名
+                        "organism": entry.get("organism", {}).get("scientificName", "N/A"),
+                        "length": entry.get("sequence", {}).get("length", 0)
+                    }
+                    # 如果推荐名没有，尝试获取提交名
+                    if protein_info["name"] == "N/A" and "submissionNames" in entry.get("proteinDescription", {}):
+                         submitted_names = entry["proteinDescription"]["submissionNames"]
+                         if submitted_names:
+                              protein_info["name"] = submitted_names[0].get("fullName", {}).get("value", "N/A")
+
+                    results_list.append(protein_info)
+            return results_list
+
+        except httpx.HTTPStatusError as e:
+            error_message = f"UniProt API returned status {e.response.status_code}."
+            try:
+                # 尝试解析错误响应体
+                error_data = e.response.json()
+                error_detail = error_data.get("messages", [str(e)])
+                error_message += f" Details: {error_detail}"
+            except ValueError: # JSONDecodeError
+                error_message += f" Response body: {e.response.text[:200]}" # 显示部分原始响应
+            logger.error(error_message)
+            # 将 API 错误包装后重新抛出，由外层捕获
+            raise ValueError(f"UniProt search failed: {error_message}") from e
+        except httpx.RequestError as e:
+            logger.error(f"Network error during UniProt search: {e}")
+            raise ValueError(f"Network error contacting UniProt: {e}") from e
+        except json.JSONDecodeError as e:
+             logger.error(f"Failed to parse UniProt search response: {e}")
+             raise ValueError("Failed to parse response from UniProt.") from e
+# ---------------------------------------
+
 @mcp.tool()
-async def search_proteins(query: str, species_filter: str | None = None, keyword_filter: str | None = None, limit: int = 10) -> List[Dict[str, Any]] | Dict[str, str]:
+async def search_proteins(query: str, species_filter: Optional[str] = None, keyword_filter: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]] | Dict[str, Any]:
     """
     根据关键词、物种等条件在 UniProt 数据库中搜索蛋白质。
 
     Args:
         query: 必需，搜索关键词（如基因名、功能描述等）。
-        species_filter: 可选，物种科学名称或 NCBI 分类 ID 进行过滤。
-        keyword_filter: 可选，使用 UniProt 关键字进行过滤。
-        limit: 可选，限制返回结果的数量，默认为 10。
+        species_filter: 可选，物种科学名称 (如 "Homo sapiens") 或 NCBI 分类 ID (如 9606) 进行过滤。
+        keyword_filter: 可选，使用 UniProt 关键字 (如 "Kinase") 进行过滤。
+        limit: 可选，限制返回结果的数量，默认为 10，最大为 50。
 
     Returns:
-        包含蛋白质列表的数组，每个蛋白质是一个包含 'id', 'name', 'organism' 等信息的对象；或在出错时包含 'error' 的字典。
+        包含蛋白质列表的数组，每个蛋白质是一个包含 'id', 'entry_name', 'name', 'organism', 'length' 等信息的对象；或在出错时包含 'error' 的字典。
     """
-    logger.info(f"Tool 'search_proteins' called with query: '{query}', species: {species_filter}, limit: {limit}")
-    # --- 实现 search_tool_impl ---
-    # 你需要在 protein_utils.py 或这里实现 search_tool_impl 函数
-    # 它应该调用 UniProt 的搜索 API
-    # 例如: https://rest.uniprot.org/uniprotkb/search?query=your_query&fields=accession,id,organism_name&size=limit
-    # 需要处理查询构建、API 调用、错误处理和结果格式化
-    # --- --------------------- ---
+    logger.info(f"Tool 'search_proteins' called with query: '{query}', species: {species_filter}, keyword: {keyword_filter}, limit: {limit}")
     try:
-        # 确保 limit 有一个合理的上限，防止请求过多数据
-        safe_limit = min(limit, 50) # 例如，最多返回 50 条
-        results = await search_tool_impl(query, species_filter, keyword_filter, safe_limit)
-        logger.info(f"Search returned {len(results)} results.")
+        # 添加基本的输入验证和限制
+        safe_limit = max(1, min(limit, 50)) # 确保 limit 在 1 到 50 之间
+        if not query or not query.strip():
+            return {"error": "Search query cannot be empty."}
+
+        # 调用内部实现的搜索函数
+        results = await _perform_uniprot_search(query, species_filter, keyword_filter, safe_limit)
+        logger.info(f"Search returned {len(results)} results (limit was {safe_limit}).")
         return results
+
+    except ValueError as ve: # 捕获由 _perform_uniprot_search 抛出的特定错误
+         logger.error(f"Search failed due to value error: {ve}")
+         return {"error": str(ve)} # 将 ValueError 的消息直接作为错误信息返回
     except Exception as e:
-        logger.exception("Error in search_proteins tool")
+        logger.exception("Unexpected error in search_proteins tool")
         return {"error": f"Internal server error during protein search: {type(e).__name__}"}
 
-# 当这个脚本作为主程序运行时（即 `python mcp_server.py`）
+# --- 启动服务器 ---
 if __name__ == "__main__":
-    # 记录服务器启动信息，包括进程ID (PID) 和通信方式 (stdio)
-    logger.info(f"启动蛋白质功能预测 MCP 服务器 (PID: {os.getpid()})，使用 stdio 传输...")
-    try:
-        # 运行 MCP 服务器，指定 transport='stdio' 表示使用标准输入/输出进行通信
-        # 这个调用会阻塞，直到服务器被终止
-        mcp.run(transport='stdio')
-    except Exception as e:
-        # 如果服务器启动或运行过程中发生错误，记录异常并退出
-        logger.exception("MCP 服务器运行失败。")
-        sys.exit(1)
-    finally:
-        # 当服务器停止时（正常或异常终止），记录一条消息
-        logger.info("蛋白质功能预测 MCP 服务器已停止。")
+    logger.info("Starting MCP server with stdio transport...")
+    mcp.run(transport='stdio')
