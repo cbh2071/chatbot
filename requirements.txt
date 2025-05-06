@@ -4,12 +4,17 @@
 httpx
 
 # For the MCP server and client functionality (includes CLI tools)
-mcp[cli]
+# Using the [cli] extra installs dependencies needed for mcp command line tools
+mcp[cli]>=1.7.1 # 指定一个已知可用的版本（或最新）
 
 # For the web user interface
 gradio
 
+# For loading environment variables from .env file (used in config.py)
+python-dotenv
+
 # --- Optional / Model Specific ---
-openai
-anthropic
-google.generativeai
+# Uncomment the LLM clients you intend to use
+# openai
+# anthropic
+# google-generativeai
