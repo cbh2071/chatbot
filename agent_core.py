@@ -7,7 +7,7 @@ import sys
 import os
 import contextlib # 用于 AsyncExitStack
 from typing import List, Dict, Any, Optional, Tuple
-
+import anyio
 import config                   # 导入配置
 from llm_clients import get_llm_client, BaseLLMClient # 导入 LLM 客户端工厂和基类
 
@@ -36,6 +36,7 @@ class AgentCore:
         self._mcp_ready = asyncio.Event() # 用于指示 MCP 客户端是否准备就绪
 
         logger.info(f"AgentCore 初始化，使用 LLM: {llm_provider}，准备启动 MCP 客户端...")
+        print(f"AnyIO Backend: {anyio.get_backend_name()}")
 
     async def start(self):
         """启动 Agent Core，包括启动和连接 MCP 客户端。"""

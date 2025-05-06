@@ -9,6 +9,7 @@ load_dotenv()
 # LLM 配置
 DEFAULT_LLM_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "openai")
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE")
 
 # 获取 API 密钥
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
