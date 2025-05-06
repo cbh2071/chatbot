@@ -26,7 +26,6 @@ class AgentCore:
             raise ValueError(f"无法初始化 LLM 客户端: {llm_provider}")
 
         # MCP 相关状态
-        self.mcp_process: Optional[subprocess.Popen] = None
         self.mcp_session: Optional[ClientSession] = None
         # AsyncExitStack 用于优雅地管理异步上下文资源 (如 stdio_client)
         self.mcp_exit_stack: contextlib.AsyncExitStack = contextlib.AsyncExitStack()
@@ -62,8 +61,6 @@ class AgentCore:
             server_info = init_result.serverInfo
             logger.info(f"MCP 连接成功。服务器: {server_info.name} v{server_info.version}, 能力: {server_caps}")
             self._mcp_ready.set()
-            # 添加小的延迟，确保服务器完全初始化
-            await asyncio.sleep(0.1)
             return True
         except Exception as e:
             logger.exception("启动 MCP 客户端失败!")
@@ -77,14 +74,6 @@ class AgentCore:
         self._mcp_ready.clear()
         await self.mcp_exit_stack.aclose()
         self.mcp_session = None
-        if self.mcp_process and self.mcp_process.poll() is None:
-             logger.warning("MCP 进程在 exit stack 清理后仍在运行，尝试强制终止。")
-             try:
-                 self.mcp_process.terminate()
-                 self.mcp_process.wait(timeout=1)
-             except:
-                 self.mcp_process.kill()
-        self.mcp_process = None
         logger.info("MCP 客户端已停止。")
 
     async def _ensure_mcp_ready(self) -> bool:
@@ -175,6 +164,19 @@ class AgentCore:
         logger.info(f"准备通过 asyncio.wait_for 调用 mcp_session.call_tool for '{tool_name}'...")
         try:
             # 使用 asyncio.wait_for 包装 await 调用
+            server_params = StdioServerParameters(
+                command=sys.executable,
+                args=[self.mcp_server_script],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            streams = await self.mcp_exit_stack.enter_async_context(stdio_client(server_params))
+            self.mcp_session = await self.mcp_exit_stack.enter_async_context(
+                ClientSession(streams[0], streams[1])
+            )
+            init_result = await self.mcp_session.initialize()
+            server_caps = init_result.capabilities
+            server_info = init_result.serverInfo
+            logger.info(f"MCP 连接成功。服务器: {server_info.name} v{server_info.version}, 能力: {server_caps}")
             result: mcp_types.CallToolResult = await asyncio.wait_for(
                 self.mcp_session.call_tool(
                     name=tool_name,
@@ -275,6 +277,11 @@ class AgentCore:
         处理单条用户消息的完整流程。
         """
         logger.info(f"Agent Core: 收到用户消息: {user_input}")
+        # result = await self.mcp_session.call_tool(
+        #         name="get_protein_data",
+        #         arguments={"identifier": "P00533"}
+        #     )
+        # print("工具返回：", result)
         if not await self._ensure_mcp_ready():
             return "抱歉，后台服务暂时遇到问题，请稍后再试。"
 
