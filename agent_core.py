@@ -34,7 +34,6 @@ class AgentCore:
         self._mcp_ready = asyncio.Event() # 用于指示 MCP 客户端是否准备就绪
 
         logger.info(f"AgentCore 初始化，使用 LLM: {llm_provider}，准备启动 MCP 客户端...")
-        print(f"AnyIO Backend: {anyio.get_backend_name()}")
 
     async def start(self):
         """启动 Agent Core，包括启动和连接 MCP 客户端。"""
