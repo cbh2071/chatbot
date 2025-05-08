@@ -191,53 +191,49 @@ class AgentCore:
                 logger.error(f"MCP 工具 '{tool_name}' 返回错误: {error_content}")
                 return {"error": f"工具执行错误: {error_content}"}
             else:
-                if result.content and len(result.content) == 1:
-                    content_item = result.content[0]
-                    if isinstance(content_item, mcp_types.TextContent) and content_item.text:
-                        try:
-                            parsed_result = json.loads(content_item.text)
-                            logger.debug(f"工具 '{tool_name}' 返回结果 (解析后): {parsed_result}")
-                            # 对 search_proteins 做检查
-                            if tool_name == "search_proteins" and not isinstance(parsed_result, list):
-                                logger.warning(f"Search tool did not return a list: {type(parsed_result)}")
-                                return {"error": "Search tool returned unexpected format."}
-                            # 对 get_protein_data 确保返回字典
-                            if tool_name == "get_protein_data" and not isinstance(parsed_result, dict):
-                                logger.warning(f"Get Protein Data tool did not return a dict: {type(parsed_result)}")
-                                return {"error": "Get Protein Data tool returned unexpected format."}
-                            return parsed_result
-                        except json.JSONDecodeError:
-                            logger.warning(f"工具 '{tool_name}' 返回了非 JSON 文本，直接使用。")
-                            return {"result_text": content_item.text}
-                    elif hasattr(content_item, 'model_dump') and callable(content_item.model_dump):
-                         logger.debug(f"工具 '{tool_name}' 返回结果 (Pydantic): {content_item.model_dump()}")
-                         parsed_result = content_item.model_dump()
-                         if tool_name == "search_proteins" and not isinstance(parsed_result, list):
-                              logger.warning(f"Search tool did not return a list: {type(parsed_result)}")
-                              return {"error": "Search tool returned unexpected format."}
-                         if tool_name == "get_protein_data" and not isinstance(parsed_result, dict):
-                              logger.warning(f"Get Protein Data tool did not return a dict: {type(parsed_result)}")
-                              return {"error": "Get Protein Data tool returned unexpected format."}
-                         return parsed_result
+                # --- 新的处理逻辑 ---
+                processed_results = []
+                if result.content:
+                    # 遍历 content 列表中的所有项
+                    for content_item in result.content:
+                        if isinstance(content_item, mcp_types.TextContent) and content_item.text:
+                            try:
+                                # 尝试将每个 TextContent 的 text 解析为 JSON (字典)
+                                item_dict = json.loads(content_item.text)
+                                processed_results.append(item_dict)
+                            except json.JSONDecodeError:
+                                logger.warning(f"工具 '{tool_name}' 返回的 TextContent 无法解析为 JSON: {content_item.text[:100]}...")
+                                # 可以选择忽略这个无法解析的项目，或者将其作为纯文本加入
+                                # processed_results.append({"unparsed_text": content_item.text})
+                        elif isinstance(content_item, mcp_types.DictContent): # 如果SDK直接支持字典
+                             processed_results.append(content_item.model_dump())
+                        # 可以添加对 ImageContent 等其他类型的处理
+                        else:
+                            logger.warning(f"工具 '{tool_name}' 返回了未处理的内容类型: {type(content_item)}")
+
+                    # 如果成功处理了任何内容项
+                    if processed_results:
+                        logger.info(f"工具 '{tool_name}' 成功处理了 {len(processed_results)} 个结果项。")
+                        # 对于搜索结果，将其包装在一个 "results" 键下，形成一个标准的成功响应结构
+                        return {"results": processed_results}
                     else:
-                         logger.warning(f"工具 '{tool_name}' 返回了未预期的内容类型或空内容。")
-                         return {"warning": "工具返回了非预期格式的内容。"}
-                elif tool_name == "search_proteins" and not result.content:
-                     logger.info(f"工具 '{tool_name}' 成功执行但未返回任何内容 (可能是搜索无结果)。")
-                     return []
+                        # 虽然 isError=False，但没有可处理的内容
+                        logger.warning(f"工具 '{tool_name}' 成功执行但未返回可处理的内容。")
+                        return {"warning": "工具成功执行，但未返回有效数据。"}
                 else:
-                    logger.warning(f"工具 '{tool_name}' 返回了多个内容项或无内容（非搜索工具）。")
-                    return {"success": True, "raw_content": "Complex or empty content"}
+                    # isError=False 但 content 为空
+                    logger.info(f"工具 '{tool_name}' 成功执行但返回了空内容列表。")
+                    # 返回一个空的 results 列表，表示搜索成功但没有匹配项
+                    return {"results": []}
+                # --- 处理逻辑结束 ---
 
         except asyncio.TimeoutError:
-             # 修改日志，明确是 wait_for 超时
-             logger.error(f"asyncio.wait_for 在等待 mcp_session.call_tool('{tool_name}') 时超时（超过 {tool_timeout} 秒）。")
-             return {"error": f"调用工具 '{tool_name}' 超时 (超过 {tool_timeout} 秒)。请尝试简化查询或稍后再试。"}
+             logger.error(f"调用 MCP 工具 '{tool_name}' 超时。")
+             return {"error": f"调用工具 '{tool_name}' 超时。"}
         except Exception as e:
-            # 添加日志，记录调用时发生的异常
-            logger.exception(f"调用 mcp_session.call_tool('{tool_name}') 时或处理结果时发生异常。")
+            logger.exception(f"Agent Core: 调用 MCP 工具 '{tool_name}' 时发生意外错误。")
             return {"error": f"调用工具 '{tool_name}' 时发生内部错误: {type(e).__name__}"}
-
+        
     async def _generate_final_response(self, user_input: str, plan: dict | None, tool_result: dict | None) -> str:
         """
         使用 LLM 生成最终给用户的回复。

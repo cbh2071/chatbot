@@ -119,7 +119,7 @@ async def _perform_uniprot_search(query: str, species_filter: Optional[str], key
 
     params = {
         "query": full_query,
-        "fields": ",".join(fields),
+        "fields": fields,
         "format": "json",
         "size": limit
     }
