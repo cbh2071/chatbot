@@ -27,23 +27,22 @@ Unlike simple "input sequence -> output prediction" tools, the goal is to create
 
 ```mermaid
 graph LR
-    User[用户] -- 自然语言 --> ChatUI[聊天界面 (Gradio)] # 更新为 Gradio
+    User[用户] -- 自然语言 --> ChatUI[聊天界面 (Gradio)]
     ChatUI -- 用户输入/事件 --> AgentCore[智能代理核心 (Python + LLM API)]
 
     subgraph Agent Core Logic
         AgentCore -- 理解/规划/生成 --> LLM_API[LLM API (OpenAI/Claude/Gemini...)]
         AgentCore -- 状态/历史 --> DialogMgr[对话管理器]
-        AgentCore -- 工具调用 --> MCPClient[MCP 客户端 (in AgentCore)] # MCP Client 在 AgentCore 内部
+        AgentCore -- 工具调用 --> MCPClient[MCP 客户端 (in AgentCore)]
     end
 
     subgraph Backend Tools via MCP
-        AgentCore -- MCP协议 (stdio) --> MCPServer[MCP 服务器 (mcp_server.py)] # AgentCore 直接通过 stdio 启动和通信
+        AgentCore -- MCP协议 (stdio) --> MCPServer[MCP 服务器 (mcp_server.py)]
     end
 
     subgraph MCP Server Implementation
         MCPServer -- 导入/调用 --> PredictionModel[预测模型逻辑 (model_predictor.py)]
         MCPServer -- 导入/调用 --> UniProtUtils[UniProt工具逻辑 (protein_utils.py)]
-        # PlotServer 可类似地被 MCPServer 导入
     end
 
     AgentCore -- 格式化回复 --> ChatUI

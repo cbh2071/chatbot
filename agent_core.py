@@ -155,7 +155,7 @@ class AgentCore:
 
         logger.info(f"Agent Core: 开始执行工具 '{tool_name}'，参数: {arguments}")
 
-        tool_timeout = 90.0 if tool_name == "search_proteins" else 30.0
+        tool_timeout = 30.0
         logger.info(f"为工具 '{tool_name}' 设置超时: {tool_timeout} 秒 (使用 asyncio.wait_for)")
 
         # 添加日志：准备调用
@@ -182,6 +182,7 @@ class AgentCore:
                 ),
                 timeout=tool_timeout
             )
+            logger.info(f"'{tool_name}' 返回结果: {result}")
             # 添加日志：调用返回
             logger.info(f"asyncio.wait_for mcp_session.call_tool for '{tool_name}' 调用返回（可能成功或工具内部错误）。")
 
